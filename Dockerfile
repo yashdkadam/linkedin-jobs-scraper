@@ -6,13 +6,3 @@ RUN npm install --include=dev
 COPY . ./
 
 CMD ["node", "src/main.js"]
-```
-
----
-
-### `.gitignore`
-```
-node_modules/
-.env
-storage/
-*.log
