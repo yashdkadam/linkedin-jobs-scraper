@@ -7,8 +7,8 @@
     "start": "node src/main.js"
   },
   "dependencies": {
-    "apify": "^3.7.0",
-    "crawlee": "^3.16.0",
-    "playwright": "^1.59.0"
+    "apify": "^3.0.0",
+    "crawlee": "^3.0.0",
+    "playwright-chromium": "^1.40.0"
   }
 }
