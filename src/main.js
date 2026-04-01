@@ -1,178 +1,110 @@
 import { Actor } from "apify";
-import { PlaywrightCrawler, Dataset, RequestQueue } from "crawlee";
+import {
+  PlaywrightCrawler,
+  HttpCrawler,
+  ProxyConfiguration,
+  Dataset,
+} from "crawlee";
 
 await Actor.init();
 
-const input = await Actor.getInput();
-const { urls = [], count = 1000 } = input;
+// 🔥 PROXY CONFIG (ROTATION)
+const proxyConfiguration = await Actor.createProxyConfiguration({
+  useApifyProxy: true,
+  groups: ["RESIDENTIAL"], // BEST for LinkedIn
+});
 
-if (!urls.length) throw new Error("No URLs provided!");
-
+// 🔥 DEDUP SET
 const seen = new Set();
-const requestQueue = await RequestQueue.open();
 
-// ✅ Seed URLs
-for (const url of urls) {
-  await requestQueue.addRequest({
-    url,
-    userData: { label: "LIST" },
-  });
-}
+// ========================================
+// ⚡ FAST LIST SCRAPER (HTTP BASED)
+// ========================================
+const listCrawler = new HttpCrawler({
+  proxyConfiguration,
+  maxConcurrency: 50, // 🔥 HIGH
+  requestHandler: async ({ request, body, enqueueLinks, log }) => {
+    const html = body.toString();
 
-const crawler = new PlaywrightCrawler({
-  requestQueue,
+    const links = [
+      ...html.matchAll(
+        /href="(https:\/\/www\.linkedin\.com\/jobs\/view\/[^"]+)"/g,
+      ),
+    ].map((m) => m[1]);
 
-  // 🔥 PROXY (CRITICAL for LinkedIn)
-  proxyConfiguration: await Actor.createProxyConfiguration({
-    useApifyProxy: true,
-    groups: ["RESIDENTIAL"],
-  }),
+    log.info(`Found ${links.length} jobs`);
 
-  // 🔥 SAFE PARALLELISM
-  minConcurrency: 5,
-  maxConcurrency: 15,
+    const uniqueLinks = links.filter((l) => {
+      if (seen.has(l)) return false;
+      seen.add(l);
+      return true;
+    });
 
-  // ⏱ Timeouts
-  requestHandlerTimeoutSecs: 120,
-  maxRequestRetries: 5,
-
-  // 🔄 Session rotation
-  useSessionPool: true,
-  sessionPoolOptions: {
-    maxPoolSize: 50,
+    await enqueueLinks({
+      urls: uniqueLinks,
+      label: "DETAIL",
+    });
   },
+});
+
+// ========================================
+// 🧠 DETAIL SCRAPER (LIMITED PLAYWRIGHT)
+// ========================================
+const detailCrawler = new PlaywrightCrawler({
+  proxyConfiguration,
+  maxConcurrency: 20, // 🔥 balance speed + avoid block
 
   launchContext: {
     launchOptions: {
       headless: true,
-      executablePath: "/usr/bin/google-chrome-stable",
-      args: ["--no-sandbox", "--disable-dev-shm-usage"],
     },
   },
 
-  async requestHandler({ page, request, log }) {
-    const { label } = request.userData;
+  requestHandler: async ({ page, request, log }) => {
+    try {
+      await page.goto(request.url, { timeout: 15000 });
 
-    // 🔥 HUMAN-LIKE DELAY
-    await page.waitForTimeout(2000 + Math.random() * 2000);
-
-    // =========================
-    // 📄 LIST PAGE
-    // =========================
-    if (label === "LIST") {
-      log.info(`LIST: ${request.url}`);
-
-      await page.waitForLoadState("domcontentloaded");
-
-      await page.waitForSelector(".jobs-search__results-list", {
-        timeout: 30000,
-      });
-
-      // 🔽 Scroll to load jobs
-      let prevCount = 0;
-
-      for (let i = 0; i < 10; i++) {
-        await page.evaluate(() =>
-          window.scrollTo(0, document.body.scrollHeight),
-        );
-        await page.waitForTimeout(1200);
-
-        const currentCount = await page.$$eval(
-          ".jobs-search__results-list li",
-          (els) => els.length,
-        );
-
-        if (currentCount === prevCount) break;
-        prevCount = currentCount;
-      }
-
-      // 🔗 Extract job links
-      let links = await page.$$eval(".jobs-search__results-list li a", (as) =>
-        as.map((a) => a.href),
-      );
-
-      // ❌ Remove authwall + invalid links
-      links = links.filter(
-        (l) => l && !l.includes("authwall") && l.includes("/jobs/view/"),
-      );
-
-      log.info(`Valid links: ${links.length}`);
-
-      // ✅ Enqueue detail pages (dedup)
-      for (const link of links) {
-        if (!seen.has(link) && seen.size < count) {
-          seen.add(link);
-
-          await requestQueue.addRequest({
-            url: link,
-            userData: { label: "DETAIL" },
-          });
-        }
-      }
-
-      // 🔥 PAGINATION
-      const nextBtn = await page.$('button[aria-label="Next"]');
-
-      if (nextBtn) {
-        const disabled = await nextBtn.isDisabled();
-
-        if (!disabled) {
-          log.info("Moving to next page...");
-
-          await nextBtn.click();
-          await page.waitForTimeout(2500);
-
-          await requestQueue.addRequest({
-            url: page.url(),
-            userData: { label: "LIST" },
-          });
-        }
-      }
-    }
-
-    // =========================
-    // 📄 DETAIL PAGE
-    // =========================
-    else if (label === "DETAIL") {
-      log.info(`DETAIL: ${request.url}`);
-
-      await page.waitForLoadState("domcontentloaded");
-
-      // ❌ Skip blocked pages
+      // ❌ skip authwall
       if (page.url().includes("authwall")) {
-        log.warning("Blocked (authwall) → skipping");
+        log.warning(`Blocked: ${request.url}`);
         return;
       }
 
-      await page.waitForTimeout(1000);
+      const data = await page.evaluate(() => ({
+        title: document.querySelector("h1")?.innerText || null,
+        company:
+          document.querySelector(".topcard__org-name-link")?.innerText || null,
+        location:
+          document.querySelector(".topcard__flavor--bullet")?.innerText || null,
+        description:
+          document.querySelector(".show-more-less-html__markup")?.innerText ||
+          null,
+        link: window.location.href,
+      }));
 
-      const job = await page.evaluate(() => {
-        const get = (sel) =>
-          document.querySelector(sel)?.innerText?.trim() || null;
-
-        return {
-          title: get("h1"),
-          company: get(".topcard__org-name-link, .topcard__flavor"),
-          location: get(".topcard__flavor--bullet"),
-          description:
-            document.querySelector(".show-more-less-html__markup")?.innerText ||
-            null,
-          link: window.location.href,
-        };
-      });
-
-      // ❌ Skip empty results
-      if (!job.title) return;
-
-      await Dataset.pushData(job);
+      await Dataset.pushData(data);
+    } catch (err) {
+      log.error(`Failed: ${request.url}`);
     }
-  },
-
-  failedRequestHandler({ request, error, log }) {
-    log.error(`Failed: ${request.url} → ${error.message}`);
   },
 });
 
-await crawler.run();
+// ========================================
+// 🚀 START FLOW
+// ========================================
+
+// 🔥 PAGINATION (1000+ jobs)
+const startUrls = [];
+
+for (let i = 0; i < 1000; i += 25) {
+  startUrls.push(
+    `https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?start=${i}`,
+  );
+}
+
+await listCrawler.run(startUrls);
+
+// 🔥 Process detail pages in parallel
+await detailCrawler.run();
 
 await Actor.exit();
