@@ -6,17 +6,10 @@ await Actor.init();
 const input = await Actor.getInput();
 const { urls = [], count = 1000 } = input;
 
-if (!urls.length) throw new Error("No URLs provided!");
-
-console.log(`Starting scraper for ${urls.length} URL(s), max ${count}`);
-
-// ✅ Dedup set
-const seenJobs = new Set();
-
-// ✅ Request Queue (for pagination + job links)
+const seen = new Set();
 const requestQueue = await RequestQueue.open();
 
-// Add initial search URLs
+// seed URLs
 for (const url of urls) {
   await requestQueue.addRequest({
     url,
@@ -27,11 +20,15 @@ for (const url of urls) {
 const crawler = new PlaywrightCrawler({
   requestQueue,
 
-  // ✅ 6 min timeout
-  requestHandlerTimeoutSecs: 360,
+  proxyConfiguration: await Actor.createProxyConfiguration({
+    useApifyProxy: true,
+    groups: ["RESIDENTIAL"], // 🔥 much harder to block
+  }),
 
-  // ✅ Parallel scraping
-  maxConcurrency: 10,
+  // ⚡ HIGH PARALLELISM (use your infra)
+  maxConcurrency: 50,
+
+  requestHandlerTimeoutSecs: 120,
 
   launchContext: {
     launchOptions: {
@@ -42,51 +39,43 @@ const crawler = new PlaywrightCrawler({
   },
 
   useSessionPool: true,
-  maxRequestRetries: 3,
+  maxRequestRetries: 2,
 
-  async requestHandler({ page, request, enqueueLinks, log }) {
+  async requestHandler({ page, request, log }) {
     const { label } = request.userData;
 
-    // =========================
-    // 📄 LIST PAGE (Search page)
-    // =========================
+    // ================= LIST =================
     if (label === "LIST") {
-      log.info(`LIST: ${request.url}`);
-
       await page.waitForLoadState("domcontentloaded");
 
       await page.waitForSelector(".jobs-search__results-list", {
-        timeout: 60000,
+        timeout: 30000,
       });
 
-      // ✅ Scroll to load jobs
-      let prevCount = 0;
-      for (let i = 0; i < 20; i++) {
+      // ⚡ fast scroll (reduced loops)
+      for (let i = 0; i < 10; i++) {
         await page.evaluate(() =>
           window.scrollTo(0, document.body.scrollHeight),
         );
-        await page.waitForTimeout(1500);
-
-        const countNow = await page.$$eval(
-          ".jobs-search__results-list li",
-          (els) => els.length,
-        );
-
-        if (countNow === prevCount) break;
-        prevCount = countNow;
+        await page.waitForTimeout(1000);
       }
 
-      // ✅ Extract job links
-      const links = await page.$$eval(".jobs-search__results-list li a", (as) =>
+      // extract links
+      let links = await page.$$eval(".jobs-search__results-list li a", (as) =>
         as.map((a) => a.href),
       );
 
-      log.info(`Found ${links.length} job links`);
+      // ✅ remove junk links (authwall fix)
+      links = links.filter(
+        (l) => l && !l.includes("authwall") && l.includes("/jobs/view/"),
+      );
 
-      // ✅ Enqueue job detail pages (dedup here too)
+      log.info(`Valid links: ${links.length}`);
+
+      // enqueue detail pages
       for (const link of links) {
-        if (!seenJobs.has(link)) {
-          seenJobs.add(link);
+        if (!seen.has(link) && seen.size < count) {
+          seen.add(link);
 
           await requestQueue.addRequest({
             url: link,
@@ -95,48 +84,44 @@ const crawler = new PlaywrightCrawler({
         }
       }
 
-      // =========================
-      // 🔥 PAGINATION
-      // =========================
+      // 🔥 pagination (robust)
       const nextBtn = await page.$('button[aria-label="Next"]');
 
       if (nextBtn) {
-        const isDisabled = await nextBtn.getAttribute("disabled");
+        const disabled = await nextBtn.isDisabled();
 
-        if (!isDisabled) {
-          const nextUrl = await page.evaluate(() => {
-            const btn = document.querySelector('button[aria-label="Next"]');
-            btn.click();
-            return window.location.href;
-          });
-
-          log.info(`Enqueue next page`);
+        if (!disabled) {
+          await nextBtn.click();
+          await page.waitForTimeout(2000);
 
           await requestQueue.addRequest({
-            url: nextUrl,
+            url: page.url(),
             userData: { label: "LIST" },
           });
         }
       }
     }
 
-    // =========================
-    // 📄 DETAIL PAGE
-    // =========================
+    // ================= DETAIL =================
     else if (label === "DETAIL") {
-      log.info(`DETAIL: ${request.url}`);
-
       await page.waitForLoadState("domcontentloaded");
-      await page.waitForTimeout(1500);
+
+      // ⚡ fail fast if redirected
+      if (page.url().includes("authwall")) {
+        log.warning("Blocked → skipping");
+        return;
+      }
+
+      // ⚡ small wait (not too long)
+      await page.waitForTimeout(1000);
 
       const job = await page.evaluate(() => {
-        const getText = (sel) =>
-          document.querySelector(sel)?.innerText?.trim() || null;
+        const get = (s) => document.querySelector(s)?.innerText?.trim() || null;
 
         return {
-          title: getText("h1"),
-          company: getText(".topcard__org-name-link, .topcard__flavor"),
-          location: getText(".topcard__flavor--bullet"),
+          title: get("h1"),
+          company: get(".topcard__org-name-link, .topcard__flavor"),
+          location: get(".topcard__flavor--bullet"),
           description:
             document.querySelector(".show-more-less-html__markup")?.innerText ||
             null,
@@ -144,15 +129,13 @@ const crawler = new PlaywrightCrawler({
         };
       });
 
+      // ✅ skip empty junk
+      if (!job.title) return;
+
       await Dataset.pushData(job);
     }
-  },
-
-  failedRequestHandler({ request, error, log }) {
-    log.error(`Failed: ${request.url} → ${error.message}`);
   },
 });
 
 await crawler.run();
-
 await Actor.exit();
