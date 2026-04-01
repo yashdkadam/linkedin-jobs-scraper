@@ -1,6 +1,5 @@
 import { Actor } from "apify";
-import { chromium } from "playwright-chromium";
-import { scrapeLinkedInJobs } from "./scraper.js";
+import { PlaywrightCrawler, Dataset } from "crawlee";
 
 await Actor.init();
 
@@ -13,65 +12,82 @@ console.log(
   `Starting LinkedIn scraper for ${urls.length} URL(s), max ${count} jobs each`,
 );
 
-// ✅ Launch browser (NO executablePath override needed in Apify)
-const browser = await chromium.launch({
-  headless: true,
-  args: [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-gpu",
-  ],
-});
+// ✅ Create crawler
+const crawler = new PlaywrightCrawler({
+  maxRequestsPerCrawl: urls.length,
 
-// ✅ Better context (anti-bot friendly)
-const context = await browser.newContext({
-  userAgent:
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  locale: "en-US",
-  viewport: { width: 1366, height: 768 },
-});
+  launchContext: {
+    launchOptions: {
+      headless: true,
+      executablePath: "/usr/bin/google-chrome-stable", // ✅ Apify Chrome
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+      ],
+    },
+  },
 
-// ✅ Set higher timeout globally
-context.setDefaultNavigationTimeout(90000);
-context.setDefaultTimeout(60000);
+  // ✅ Anti-blocking
+  useSessionPool: true,
+  sessionPoolOptions: {
+    maxPoolSize: 10,
+  },
 
-const page = await context.newPage();
-const dataset = await Actor.openDataset();
+  // ✅ Retry failed requests
+  maxRequestRetries: 3,
 
-for (const url of urls) {
-  try {
-    console.log(`Navigating to: ${url}`);
+  // ✅ Handle each page
+  async requestHandler({ page, request, log }) {
+    log.info(`Processing: ${request.url}`);
 
-    // ✅ FIX: DO NOT use networkidle
-    await page.goto(url, {
-      waitUntil: "domcontentloaded",
-      timeout: 60000,
-    });
+    // ✅ Wait for page load
+    await page.waitForLoadState("domcontentloaded");
 
-    // ✅ Wait for jobs list instead
+    // ✅ Wait for job list
     await page.waitForSelector(".jobs-search__results-list", {
       timeout: 30000,
     });
 
-    // ✅ Small delay (anti-bot)
-    await page.waitForTimeout(3000);
+    // ✅ Scroll to load more jobs
+    let previousHeight = 0;
+    for (let i = 0; i < 10; i++) {
+      const currentHeight = await page.evaluate(
+        () => document.body.scrollHeight,
+      );
 
-    const jobs = await scrapeLinkedInJobs(page, url, count);
+      if (currentHeight === previousHeight) break;
 
-    console.log(`Scraped ${jobs.length} jobs from ${url}`);
-    await dataset.pushData(jobs);
-  } catch (err) {
-    console.error(`Failed to scrape ${url}: ${err.message}`);
+      previousHeight = currentHeight;
 
-    // ❌ Don't kill whole actor for one failure
-    await Actor.pushData({
-      url,
-      error: err.message,
-    });
-  }
-}
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await page.waitForTimeout(2000);
+    }
 
-await browser.close();
+    // ✅ Extract jobs
+    const jobs = await page.$$eval(".jobs-search__results-list li", (items) =>
+      items.slice(0, 100).map((el) => ({
+        title: el.querySelector("h3")?.innerText || null,
+        company: el.querySelector("h4")?.innerText || null,
+        location:
+          el.querySelector(".job-search-card__location")?.innerText || null,
+        link: el.querySelector("a")?.href || null,
+      })),
+    );
+
+    log.info(`Extracted ${jobs.length} jobs`);
+
+    // ✅ Save to dataset
+    await Dataset.pushData(jobs.slice(0, count));
+  },
+
+  // ❌ Handle failures gracefully
+  failedRequestHandler({ request, error, log }) {
+    log.error(`Failed: ${request.url} → ${error.message}`);
+  },
+});
+
+// ✅ Run crawler
+await crawler.run(urls);
+
 await Actor.exit();
