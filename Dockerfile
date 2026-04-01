@@ -4,8 +4,8 @@ COPY package*.json ./
 
 RUN npm install --include=dev
 
-# ✅ This line was missing — downloads Chromium into the container
-RUN npx playwright install chromium --with-deps
+# # ✅ This line was missing — downloads Chromium into the container
+# RUN npx playwright install chromium --with-deps
 
 COPY . ./
 
