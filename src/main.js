@@ -1,107 +1,151 @@
 import { Actor } from "apify";
-import { PlaywrightCrawler, Dataset } from "crawlee";
+import { PlaywrightCrawler, Dataset, RequestQueue } from "crawlee";
 
 await Actor.init();
 
 const input = await Actor.getInput();
-const { urls = [], count = 100000 } = input;
+const { urls = [], count = 1000 } = input;
 
-if (!urls.length) throw new Error("No URLs provided in input!");
+if (!urls.length) throw new Error("No URLs provided!");
 
-console.log(
-  `Starting LinkedIn scraper for ${urls.length} URL(s), max ${count} jobs each`,
-);
+console.log(`Starting scraper for ${urls.length} URL(s), max ${count}`);
+
+// ✅ Dedup set
+const seenJobs = new Set();
+
+// ✅ Request Queue (for pagination + job links)
+const requestQueue = await RequestQueue.open();
+
+// Add initial search URLs
+for (const url of urls) {
+  await requestQueue.addRequest({
+    url,
+    userData: { label: "LIST" },
+  });
+}
 
 const crawler = new PlaywrightCrawler({
-  maxRequestsPerCrawl: urls.length,
+  requestQueue,
 
-  // ✅ 6 minute timeout
+  // ✅ 6 min timeout
   requestHandlerTimeoutSecs: 360,
+
+  // ✅ Parallel scraping
+  maxConcurrency: 10,
 
   launchContext: {
     launchOptions: {
       headless: true,
       executablePath: "/usr/bin/google-chrome-stable",
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-      ],
+      args: ["--no-sandbox", "--disable-dev-shm-usage"],
     },
   },
 
   useSessionPool: true,
-  sessionPoolOptions: {
-    maxPoolSize: 20,
-  },
-
   maxRequestRetries: 3,
 
-  async requestHandler({ page, request, log }) {
-    log.info(`Processing: ${request.url}`);
+  async requestHandler({ page, request, enqueueLinks, log }) {
+    const { label } = request.userData;
 
-    await page.waitForLoadState("domcontentloaded");
+    // =========================
+    // 📄 LIST PAGE (Search page)
+    // =========================
+    if (label === "LIST") {
+      log.info(`LIST: ${request.url}`);
 
-    await page.waitForSelector(".jobs-search__results-list", {
-      timeout: 60000,
-    });
+      await page.waitForLoadState("domcontentloaded");
 
-    // ✅ AGGRESSIVE SCROLL (loads more jobs)
-    let lastCount = 0;
+      await page.waitForSelector(".jobs-search__results-list", {
+        timeout: 60000,
+      });
 
-    for (let i = 0; i < 200; i++) {
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await page.waitForTimeout(2000);
-
-      const currentCount = await page.$$eval(
-        ".jobs-search__results-list li",
-        (els) => els.length,
-      );
-
-      log.info(`Loaded jobs: ${currentCount}`);
-
-      if (currentCount === lastCount) break;
-      lastCount = currentCount;
-    }
-
-    // ✅ GET ALL JOB CARDS
-    const jobCards = await page.$$(".jobs-search__results-list li");
-
-    const results = [];
-
-    for (let i = 0; i < jobCards.length && results.length < count; i++) {
-      try {
-        const card = jobCards[i];
-
-        // ✅ CLICK job
-        await card.click();
+      // ✅ Scroll to load jobs
+      let prevCount = 0;
+      for (let i = 0; i < 20; i++) {
+        await page.evaluate(() =>
+          window.scrollTo(0, document.body.scrollHeight),
+        );
         await page.waitForTimeout(1500);
 
-        // ✅ EXTRACT DATA
-        const job = await page.evaluate(() => {
-          const getText = (sel) =>
-            document.querySelector(sel)?.innerText?.trim() || null;
+        const countNow = await page.$$eval(
+          ".jobs-search__results-list li",
+          (els) => els.length,
+        );
 
-          return {
-            title: getText("h2"),
-            company: getText(".topcard__org-name-link, .topcard__flavor"),
-            location: getText(".topcard__flavor--bullet"),
-            description:
-              document.querySelector(".show-more-less-html__markup")
-                ?.innerText || null,
-            link: window.location.href,
-          };
-        });
+        if (countNow === prevCount) break;
+        prevCount = countNow;
+      }
 
-        results.push(job);
-      } catch (err) {
-        log.warning(`Failed to process job ${i}: ${err.message}`);
+      // ✅ Extract job links
+      const links = await page.$$eval(".jobs-search__results-list li a", (as) =>
+        as.map((a) => a.href),
+      );
+
+      log.info(`Found ${links.length} job links`);
+
+      // ✅ Enqueue job detail pages (dedup here too)
+      for (const link of links) {
+        if (!seenJobs.has(link)) {
+          seenJobs.add(link);
+
+          await requestQueue.addRequest({
+            url: link,
+            userData: { label: "DETAIL" },
+          });
+        }
+      }
+
+      // =========================
+      // 🔥 PAGINATION
+      // =========================
+      const nextBtn = await page.$('button[aria-label="Next"]');
+
+      if (nextBtn) {
+        const isDisabled = await nextBtn.getAttribute("disabled");
+
+        if (!isDisabled) {
+          const nextUrl = await page.evaluate(() => {
+            const btn = document.querySelector('button[aria-label="Next"]');
+            btn.click();
+            return window.location.href;
+          });
+
+          log.info(`Enqueue next page`);
+
+          await requestQueue.addRequest({
+            url: nextUrl,
+            userData: { label: "LIST" },
+          });
+        }
       }
     }
 
-    log.info(`Final extracted jobs: ${results.length}`);
+    // =========================
+    // 📄 DETAIL PAGE
+    // =========================
+    else if (label === "DETAIL") {
+      log.info(`DETAIL: ${request.url}`);
 
-    await Dataset.pushData(results);
+      await page.waitForLoadState("domcontentloaded");
+      await page.waitForTimeout(1500);
+
+      const job = await page.evaluate(() => {
+        const getText = (sel) =>
+          document.querySelector(sel)?.innerText?.trim() || null;
+
+        return {
+          title: getText("h1"),
+          company: getText(".topcard__org-name-link, .topcard__flavor"),
+          location: getText(".topcard__flavor--bullet"),
+          description:
+            document.querySelector(".show-more-less-html__markup")?.innerText ||
+            null,
+          link: window.location.href,
+        };
+      });
+
+      await Dataset.pushData(job);
+    }
   },
 
   failedRequestHandler({ request, error, log }) {
@@ -109,6 +153,6 @@ const crawler = new PlaywrightCrawler({
   },
 });
 
-await crawler.run(urls);
+await crawler.run();
 
 await Actor.exit();
