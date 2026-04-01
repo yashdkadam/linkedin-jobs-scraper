@@ -1,0 +1,10 @@
+{
+  "actorSpecification": 1,
+  "name": "linkedin-jobs-scraper",
+  "title": "LinkedIn Jobs Scraper",
+  "description": "Scrapes LinkedIn job listings from search URLs",
+  "version": "0.1",
+  "buildTag": "latest",
+  "dockerfile": "./Dockerfile",
+  "input": "./input_schema.json"
+}
