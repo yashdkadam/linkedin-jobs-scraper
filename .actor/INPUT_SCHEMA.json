@@ -1,0 +1,46 @@
+{
+  "title": "LinkedIn Jobs Scraper Input",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "startUrl": {
+      "title": "Start URL",
+      "type": "string",
+      "description": "LinkedIn jobs search URL to scrape. Paste the full URL from your browser.",
+      "editor": "textfield",
+      "default": "https://www.linkedin.com/jobs/search/?f_E=1%2C2%2C3&f_F=it%2Ceng&f_TPR=r86400&geoId=102713980&location=India&sortBy=R"
+    },
+    "maxJobs": {
+      "title": "Max Jobs",
+      "type": "integer",
+      "description": "Maximum number of job listings to scrape.",
+      "default": 100,
+      "minimum": 1,
+      "maximum": 1000
+    },
+    "maxPagesPerQuery": {
+      "title": "Max Pages",
+      "type": "integer",
+      "description": "Maximum number of result pages to paginate through (each page has ~25 jobs).",
+      "default": 5,
+      "minimum": 1,
+      "maximum": 40
+    },
+    "delayBetweenJobsMs": {
+      "title": "Delay Between Jobs (ms)",
+      "type": "integer",
+      "description": "Milliseconds to wait after clicking a job card, before extracting. Increase if details aren't loading.",
+      "default": 1500,
+      "minimum": 500,
+      "maximum": 5000
+    },
+    "proxyConfiguration": {
+      "title": "Proxy Configuration",
+      "type": "object",
+      "description": "Apify Proxy settings. Residential proxies recommended for LinkedIn.",
+      "editor": "proxy",
+      "default": {}
+    }
+  },
+  "required": ["startUrl"]
+}

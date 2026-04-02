@@ -1,54 +1,44 @@
-import { Actor } from "apify";
-import { PlaywrightCrawler, Dataset, RequestQueue } from "crawlee";
+import { Actor, log as actorLog } from "apify";
+import { PlaywrightCrawler, Dataset, sleep } from "crawlee";
+import { chromium } from "playwright";
+import { extractJobDetails, buildPaginatedUrls } from "./utils.js";
 
 await Actor.init();
 
-const input = await Actor.getInput();
-const { urls = [], count = 1000 } = input;
+const input = (await Actor.getInput()) ?? {};
 
-if (!urls.length) throw new Error("No URLs provided!");
+const {
+  startUrl = "https://www.linkedin.com/jobs/search/?f_E=1%2C2%2C3&f_F=it%2Ceng&f_TPR=r86400&geoId=102713980&location=India&sortBy=R",
+  maxJobs = 100,
+  maxPagesPerQuery = 5,
+  delayBetweenJobsMs = 1500,
+  proxyConfiguration: proxyConfig,
+} = input;
 
-const seen = new Set();
-const requestQueue = await RequestQueue.open();
+const proxyConfiguration = proxyConfig
+  ? await Actor.createProxyConfiguration(proxyConfig)
+  : undefined;
 
-// ✅ Seed URLs
-for (const url of urls) {
-  await requestQueue.addRequest({
-    url,
-    userData: { label: "LIST" },
-  });
-}
+let jobsScraped = 0;
 
 const crawler = new PlaywrightCrawler({
-  requestQueue,
-
-  // 🔥 PROXY (CRITICAL for LinkedIn)
-  proxyConfiguration: await Actor.createProxyConfiguration({
-    useApifyProxy: true,
-    groups: ["RESIDENTIAL"],
-  }),
-
-  // 🔥 SAFE PARALLELISM
-  minConcurrency: 5,
-  maxConcurrency: 15,
-
-  // ⏱ Timeouts
-  requestHandlerTimeoutSecs: 120,
-  maxRequestRetries: 5,
-
-  // 🔄 Session rotation
-  useSessionPool: true,
-  sessionPoolOptions: {
-    maxPoolSize: 50,
-  },
-
+  proxyConfiguration,
   launchContext: {
+    launcher: chromium,
     launchOptions: {
       headless: true,
-      executablePath: "/usr/bin/google-chrome-stable",
-      args: ["--no-sandbox", "--disable-dev-shm-usage"],
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-blink-features=AutomationControlled",
+      ],
     },
   },
+  browserPoolOptions: {
+    useFingerprints: true,
+  },
+  maxRequestsPerCrawl: maxPagesPerQuery * 25 + 10,
+  requestHandlerTimeoutSecs: 180,
 
   async requestHandler({ page, request, log }) {
     const { label } = request.userData;
@@ -127,21 +117,45 @@ const crawler = new PlaywrightCrawler({
             userData: { label: "LIST" },
           });
         }
+        log.info(
+          `No new cards in DOM (streak ${noNewCardsStreak}/${MAX_NO_NEW_STREAK}), scrolling…`,
+        );
+        const lastCard = domCards[domCards.length - 1];
+        if (lastCard) await lastCard.scrollIntoViewIfNeeded();
+        await sleep(1500);
+        continue;
       }
-    }
 
-    // =========================
-    // 📄 DETAIL PAGE
-    // =========================
-    else if (label === "DETAIL") {
-      log.info(`DETAIL: ${request.url}`);
+      noNewCardsStreak = 0;
+      processedIds.add(targetId);
 
-      await page.waitForLoadState("domcontentloaded");
+      const cardLink = await targetCard
+        .$eval(
+          'a.base-card__full-link, a.job-card-list__title, a[href*="/jobs/view/"]',
+          (el) => el.href,
+        )
+        .catch(() => null);
 
-      // ❌ Skip blocked pages
-      if (page.url().includes("authwall")) {
-        log.warning("Blocked (authwall) → skipping");
-        return;
+      try {
+        await targetCard.scrollIntoViewIfNeeded();
+        await sleep(300);
+        await targetCard.click({ timeout: 5000 }).catch(async () => {
+          const anchor =
+            (await targetCard.$(
+              'a.base-card__full-link, a[href*="/jobs/view/"]',
+            )) ?? targetCard;
+          await anchor.dispatchEvent("click");
+        });
+      } catch (err) {
+        log.warning(`Could not click card id=${targetId}: ${err.message}`);
+        continue;
+      }
+
+      try {
+        await page.waitForSelector(DETAIL_PANEL_SELECTOR, { timeout: 15_000 });
+      } catch {
+        log.warning(`Detail panel did not load for id=${targetId}, skipping.`);
+        continue;
       }
 
       await page.waitForTimeout(500);
@@ -161,18 +175,33 @@ const crawler = new PlaywrightCrawler({
         };
       });
 
-      // ❌ Skip empty results
-      if (!job.title) return;
+      if (!job) continue;
+      if (!job.link && cardLink) job.link = cardLink;
 
+      log.info(`✓ [${jobsScraped + 1}] ${job.title} @ ${job.company}`);
       await Dataset.pushData(job);
+      jobsScraped++;
+    }
+
+    if (jobsScraped < maxJobs && pageNum + 1 < maxPagesPerQuery) {
+      const nextPageStart = (pageNum + 1) * 25;
+      const nextUrl = buildPaginatedUrls(request.url, nextPageStart);
+      if (nextUrl) {
+        await crawler.addRequests([
+          { url: nextUrl, userData: { pageNum: pageNum + 1 } },
+        ]);
+        log.info(`Queued page ${pageNum + 2}: ${nextUrl}`);
+      }
     }
   },
 
-  failedRequestHandler({ request, error, log }) {
-    log.error(`Failed: ${request.url} → ${error.message}`);
+  failedRequestHandler({ request, log }) {
+    log.error(`Request failed: ${request.url}`);
   },
 });
 
-await crawler.run();
+await crawler.run([{ url: startUrl, userData: { pageNum: 0 } }]);
 
+// FIX: `log` only exists inside requestHandler scope — use actorLog at module level
+actorLog.info(`✅ Done. Total jobs scraped: ${jobsScraped}`);
 await Actor.exit();
