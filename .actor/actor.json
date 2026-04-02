@@ -1,10 +1,11 @@
 {
   "actorSpecification": 1,
   "name": "linkedin-jobs-scraper",
-  "title": "LinkedIn Jobs Scraper",
-  "description": "Scrapes LinkedIn job listings from search URLs",
-  "version": "0.1",
-  "buildTag": "latest",
+  "title": "LinkedIn Jobs Scraper (Side-Panel, No New Tabs)",
+  "description": "Efficiently scrapes LinkedIn job listings by clicking each card and reading the right-side detail panel — no new tab per job, much faster.",
+  "version": "1.0",
+  "input": "./INPUT_SCHEMA.json",
   "dockerfile": "./Dockerfile",
-  "input": "./input_schema.json"
+  "categories": ["BUSINESS", "JOB_SCRAPING"],
+  "isPublic": false
 }
