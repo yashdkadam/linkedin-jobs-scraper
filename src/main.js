@@ -48,45 +48,72 @@ const crawler = new PlaywrightCrawler({
       Object.defineProperty(navigator, "webdriver", { get: () => false });
     });
 
-    // ── Navigate and wait for job list ──
-    await page.waitForSelector("ul.jobs-search__results-list", {
-      timeout: 30_000,
-    });
-    await sleep(1500);
+    // ── Wait for job list (try both logged-in and public selectors) ──
+    const LIST_SELECTOR =
+      "ul.jobs-search__results-list, .scaffold-layout__list-container";
+    await page.waitForSelector(LIST_SELECTOR, { timeout: 30_000 });
+    await sleep(2000); // let lazy-loaded cards render
 
     const pageNum = request.userData?.pageNum ?? 0;
     log.info(`Scraping page ${pageNum + 1}...`);
 
-    // ── Collect all job cards on this page ──
-    const jobCards = await page.$$("ul.jobs-search__results-list > li");
-    log.info(`Found ${jobCards.length} job cards`);
+    // ── Count cards once (just for logging) ──
+    // We do NOT store handles — they go stale after LinkedIn re-renders the list
+    const CARD_SELECTOR =
+      "ul.jobs-search__results-list > li, .scaffold-layout__list-container .job-card-container";
+    const totalCards = await page.$$eval(CARD_SELECTOR, (els) => els.length);
+    log.info(`Found ${totalCards} job cards`);
 
-    for (let i = 0; i < jobCards.length; i++) {
+    for (let i = 0; i < totalCards; i++) {
       if (jobsScraped >= maxJobs) {
         log.info(`Reached maxJobs limit (${maxJobs}). Stopping.`);
         return;
       }
 
-      const card = jobCards[i];
-
-      // ── Extract link + basic card data before clicking ──
-      const cardLink = await card
-        .$eval("a.base-card__full-link", (el) => el.href)
-        .catch(() => null);
-
-      // ── Click the card to load details in the right panel ──
-      try {
-        await card.scrollIntoViewIfNeeded();
-        await card.click();
-      } catch {
-        log.warning(`Could not click card ${i + 1}, skipping.`);
+      // ── Re-query the nth card fresh on every iteration (avoids stale handles) ──
+      const cards = await page.$$(CARD_SELECTOR);
+      const card = cards[i];
+      if (!card) {
+        log.warning(`Card ${i + 1} not found after re-query, skipping.`);
         continue;
       }
 
-      // ── Wait for right panel to update ──
+      // ── Grab the fallback link from the card before clicking ──
+      const cardLink = await card
+        .$eval(
+          "a.base-card__full-link, a.job-card-list__title, a[data-tracking-control-name]",
+          (el) => el.href,
+        )
+        .catch(() => null);
+
+      // ── Scroll into view then click via JS (bypasses overlay issues) ──
+      try {
+        await card.scrollIntoViewIfNeeded();
+        await sleep(300);
+
+        // Try native Playwright click first, fall back to JS click
+        await card.click({ timeout: 5000 }).catch(async () => {
+          const clickable =
+            (await card.$(
+              "a.base-card__full-link, a.job-card-list__title, .job-card-container__link",
+            )) ?? card;
+          await clickable.dispatchEvent("click");
+        });
+      } catch (err) {
+        log.warning(`Could not click card ${i + 1}: ${err.message}`);
+        continue;
+      }
+
+      // ── Wait for the right-side detail panel to reflect the new job ──
       try {
         await page.waitForSelector(
-          ".job-view-layout, .details-pane__content, .show-more-less-html",
+          [
+            ".show-more-less-html__markup",
+            ".job-view-layout",
+            ".details-pane__content",
+            ".jobs-description",
+            ".job-details-jobs-unified-top-card__job-title",
+          ].join(", "),
           { timeout: 15_000 },
         );
       } catch {
@@ -104,10 +131,9 @@ const crawler = new PlaywrightCrawler({
 
       if (!job) continue;
 
-      // Prefer the direct card link if panel link is missing
       if (!job.link && cardLink) job.link = cardLink;
 
-      log.info(`✓ [${i + 1}/${jobCards.length}] ${job.title} @ ${job.company}`);
+      log.info(`✓ [${i + 1}/${totalCards}] ${job.title} @ ${job.company}`);
       await Dataset.pushData(job);
       jobsScraped++;
     }
