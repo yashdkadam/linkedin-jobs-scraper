@@ -1,4 +1,4 @@
-import { Actor } from "apify";
+import { Actor, log as actorLog } from "apify";
 import { PlaywrightCrawler, Dataset, sleep } from "crawlee";
 import { chromium } from "playwright";
 import { extractJobDetails, buildPaginatedUrls } from "./utils.js";
@@ -8,7 +8,7 @@ await Actor.init();
 const input = (await Actor.getInput()) ?? {};
 
 const {
-  startUrl = "https://www.linkedin.com/jobs/search/?currentJobId=4331964856&f_E=1%2C2%2C3&f_F=it%2Ceng&f_TPR=r86400&geoId=102713980&keywords=&location=India&origin=JOB_SEARCH_PAGE_JOB_FILTER&sortBy=R&trk=public_jobs_jobs-search-bar_search-submit",
+  startUrl = "https://www.linkedin.com/jobs/search/?f_E=1%2C2%2C3&f_F=it%2Ceng&f_TPR=r86400&geoId=102713980&location=India&sortBy=R",
   maxJobs = 100,
   maxPagesPerQuery = 5,
   delayBetweenJobsMs = 1500,
@@ -38,17 +38,15 @@ const crawler = new PlaywrightCrawler({
     useFingerprints: true,
   },
   maxRequestsPerCrawl: maxPagesPerQuery * 25 + 10,
-  requestHandlerTimeoutSecs: 120,
+  requestHandlerTimeoutSecs: 180,
 
   async requestHandler({ page, request, log }) {
     log.info(`Processing: ${request.url}`);
 
-    // ── Anti-detection: mask navigator.webdriver ──
     await page.addInitScript(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => false });
     });
 
-    // ── Wait for job list (covers both public + logged-in LinkedIn layouts) ──
     const LIST_SELECTOR =
       "ul.jobs-search__results-list, .scaffold-layout__list-container";
     await page.waitForSelector(LIST_SELECTOR, { timeout: 30_000 });
@@ -56,19 +54,6 @@ const crawler = new PlaywrightCrawler({
 
     const pageNum = request.userData?.pageNum ?? 0;
     log.info(`Scraping page ${pageNum + 1}...`);
-
-    /**
-     * VIRTUAL LIST STRATEGY
-     * ─────────────────────
-     * LinkedIn renders only ~30-40 cards in the DOM at any time.
-     * As you scroll, old cards are REMOVED and new ones are ADDED.
-     * Iterating by index (0..totalCards) breaks past ~40.
-     *
-     * Fix: track which jobs we've already processed by their job ID
-     * (extracted from the card's data-job-id attribute or href).
-     * On each loop tick, query the current DOM cards, find the first
-     * unprocessed one, click it, then scroll to reveal more.
-     */
 
     const CARD_SELECTOR = [
       "ul.jobs-search__results-list > li",
@@ -83,29 +68,37 @@ const crawler = new PlaywrightCrawler({
       ".job-details-jobs-unified-top-card__job-title",
     ].join(", ");
 
-    // Helper: extract a stable ID from a card element
-    const getCardId = async (card) => {
-      return card
-        .getAttribute("data-job-id")
-        .catch(() =>
-          card
-            .$eval(
-              'a[href*="/jobs/view/"]',
-              (a) => a.href.match(/\/jobs\/view\/(\d+)/)?.[1] ?? a.href,
-            )
-            .catch(() => null),
-        );
-    };
+    /**
+     * BUG FIX: getCardId previously used card.getAttribute() which is a
+     * Playwright node-side API returning Promise<string|null>. When the
+     * attribute is absent it resolves to null — the .catch() branch never
+     * fires — so every card got id=null, making `id && ...` always false,
+     * and no card was ever selected.
+     *
+     * Fix: run via page.evaluate(fn, el) so the read happens inside the
+     * browser where element attributes are always accessible.
+     */
+    const getCardId = (card) =>
+      page
+        .evaluate((el) => {
+          const jobId = el.getAttribute("data-job-id");
+          if (jobId) return jobId;
+          const anchor = el.querySelector('a[href*="/jobs/view/"]');
+          if (anchor) {
+            const m = anchor.href.match(/\/jobs\/view\/(\d+)/);
+            return m ? m[1] : anchor.href;
+          }
+          return el.innerText?.trim().slice(0, 80) ?? null;
+        }, card)
+        .catch(() => null);
 
     const processedIds = new Set();
     let noNewCardsStreak = 0;
-    const MAX_NO_NEW_STREAK = 5; // stop if 5 scroll attempts yield nothing new
+    const MAX_NO_NEW_STREAK = 5;
 
     while (jobsScraped < maxJobs) {
-      // Query whatever cards are currently in the DOM
       const domCards = await page.$$(CARD_SELECTOR);
 
-      // Find the first card we haven't processed yet
       let targetCard = null;
       let targetId = null;
       for (const card of domCards) {
@@ -117,7 +110,6 @@ const crawler = new PlaywrightCrawler({
         }
       }
 
-      // No unprocessed card visible → scroll down to reveal more
       if (!targetCard) {
         noNewCardsStreak++;
         if (noNewCardsStreak >= MAX_NO_NEW_STREAK) {
@@ -127,7 +119,6 @@ const crawler = new PlaywrightCrawler({
         log.info(
           `No new cards in DOM (streak ${noNewCardsStreak}/${MAX_NO_NEW_STREAK}), scrolling…`,
         );
-        // Scroll the last visible card into view to trigger LinkedIn's lazy load
         const lastCard = domCards[domCards.length - 1];
         if (lastCard) await lastCard.scrollIntoViewIfNeeded();
         await sleep(1500);
@@ -137,7 +128,6 @@ const crawler = new PlaywrightCrawler({
       noNewCardsStreak = 0;
       processedIds.add(targetId);
 
-      // ── Grab fallback href before clicking ──
       const cardLink = await targetCard
         .$eval(
           'a.base-card__full-link, a.job-card-list__title, a[href*="/jobs/view/"]',
@@ -145,7 +135,6 @@ const crawler = new PlaywrightCrawler({
         )
         .catch(() => null);
 
-      // ── Scroll into view, then click (JS fallback if overlaid) ──
       try {
         await targetCard.scrollIntoViewIfNeeded();
         await sleep(300);
@@ -157,11 +146,10 @@ const crawler = new PlaywrightCrawler({
           await anchor.dispatchEvent("click");
         });
       } catch (err) {
-        log.warning(`Could not click card (id=${targetId}): ${err.message}`);
+        log.warning(`Could not click card id=${targetId}: ${err.message}`);
         continue;
       }
 
-      // ── Wait for right panel to load ──
       try {
         await page.waitForSelector(DETAIL_PANEL_SELECTOR, { timeout: 15_000 });
       } catch {
@@ -171,7 +159,6 @@ const crawler = new PlaywrightCrawler({
 
       await sleep(delayBetweenJobsMs);
 
-      // ── Extract ──
       const job = await page.evaluate(extractJobDetails).catch((err) => {
         log.warning(`Extraction failed for id=${targetId}: ${err.message}`);
         return null;
@@ -185,17 +172,12 @@ const crawler = new PlaywrightCrawler({
       jobsScraped++;
     }
 
-    // ── Pagination: try "Load more" or next page ──
     if (jobsScraped < maxJobs && pageNum + 1 < maxPagesPerQuery) {
       const nextPageStart = (pageNum + 1) * 25;
       const nextUrl = buildPaginatedUrls(request.url, nextPageStart);
-
       if (nextUrl) {
         await crawler.addRequests([
-          {
-            url: nextUrl,
-            userData: { pageNum: pageNum + 1 },
-          },
+          { url: nextUrl, userData: { pageNum: pageNum + 1 } },
         ]);
         log.info(`Queued page ${pageNum + 2}: ${nextUrl}`);
       }
@@ -209,5 +191,6 @@ const crawler = new PlaywrightCrawler({
 
 await crawler.run([{ url: startUrl, userData: { pageNum: 0 } }]);
 
-log.info(`✅ Done. Total jobs scraped: ${jobsScraped}`);
+// FIX: `log` only exists inside requestHandler scope — use actorLog at module level
+actorLog.info(`✅ Done. Total jobs scraped: ${jobsScraped}`);
 await Actor.exit();
