@@ -41,81 +41,80 @@ const crawler = new PlaywrightCrawler({
   requestHandlerTimeoutSecs: 180,
 
   async requestHandler({ page, request, log }) {
-    const { label } = request.userData;
+    log.info(`Processing: ${request.url}`);
 
-    // 🔥 HUMAN-LIKE DELAY
-    await page.waitForTimeout(200 + Math.random() * 200);
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => false });
+    });
 
-    // =========================
-    // 📄 LIST PAGE
-    // =========================
-    if (label === "LIST") {
-      log.info(`LIST: ${request.url}`);
+    const LIST_SELECTOR =
+      "ul.jobs-search__results-list, .scaffold-layout__list-container";
+    await page.waitForSelector(LIST_SELECTOR, { timeout: 30_000 });
+    await sleep(2000);
 
-      await page.waitForLoadState("domcontentloaded");
+    const pageNum = request.userData?.pageNum ?? 0;
+    log.info(`Scraping page ${pageNum + 1}...`);
 
-      await page.waitForSelector(".jobs-search__results-list", {
-        timeout: 3000,
-      });
+    const CARD_SELECTOR = [
+      "ul.jobs-search__results-list > li",
+      ".scaffold-layout__list-container .job-card-container",
+    ].join(", ");
 
-      // 🔽 Scroll to load jobs
-      let prevCount = 0;
+    const DETAIL_PANEL_SELECTOR = [
+      ".show-more-less-html__markup",
+      ".job-view-layout",
+      ".details-pane__content",
+      ".jobs-description",
+      ".job-details-jobs-unified-top-card__job-title",
+    ].join(", ");
 
-      for (let i = 0; i < 10; i++) {
-        await page.evaluate(() =>
-          window.scrollTo(0, document.body.scrollHeight),
-        );
-        await page.waitForTimeout(120);
+    /**
+     * BUG FIX: getCardId previously used card.getAttribute() which is a
+     * Playwright node-side API returning Promise<string|null>. When the
+     * attribute is absent it resolves to null — the .catch() branch never
+     * fires — so every card got id=null, making `id && ...` always false,
+     * and no card was ever selected.
+     *
+     * Fix: run via page.evaluate(fn, el) so the read happens inside the
+     * browser where element attributes are always accessible.
+     */
+    const getCardId = (card) =>
+      page
+        .evaluate((el) => {
+          const jobId = el.getAttribute("data-job-id");
+          if (jobId) return jobId;
+          const anchor = el.querySelector('a[href*="/jobs/view/"]');
+          if (anchor) {
+            const m = anchor.href.match(/\/jobs\/view\/(\d+)/);
+            return m ? m[1] : anchor.href;
+          }
+          return el.innerText?.trim().slice(0, 80) ?? null;
+        }, card)
+        .catch(() => null);
 
-        const currentCount = await page.$$eval(
-          ".jobs-search__results-list li",
-          (els) => els.length,
-        );
+    const processedIds = new Set();
+    let noNewCardsStreak = 0;
+    const MAX_NO_NEW_STREAK = 5;
 
-        if (currentCount === prevCount) break;
-        prevCount = currentCount;
-      }
+    while (jobsScraped < maxJobs) {
+      const domCards = await page.$$(CARD_SELECTOR);
 
-      // 🔗 Extract job links
-      let links = await page.$$eval(".jobs-search__results-list li a", (as) =>
-        as.map((a) => a.href),
-      );
-
-      // ❌ Remove authwall + invalid links
-      links = links.filter(
-        (l) => l && !l.includes("authwall") && l.includes("/jobs/view/"),
-      );
-
-      log.info(`Valid links: ${links.length}`);
-
-      // ✅ Enqueue detail pages (dedup)
-      for (const link of links) {
-        if (!seen.has(link) && seen.size < count) {
-          seen.add(link);
-
-          await requestQueue.addRequest({
-            url: link,
-            userData: { label: "DETAIL" },
-          });
+      let targetCard = null;
+      let targetId = null;
+      for (const card of domCards) {
+        const id = await getCardId(card);
+        if (id && !processedIds.has(id)) {
+          targetCard = card;
+          targetId = id;
+          break;
         }
       }
 
-      // 🔥 PAGINATION
-      const nextBtn = await page.$('button[aria-label="Next"]');
-
-      if (nextBtn) {
-        const disabled = await nextBtn.isDisabled();
-
-        if (!disabled) {
-          log.info("Moving to next page...");
-
-          await nextBtn.click();
-          await page.waitForTimeout(250);
-
-          await requestQueue.addRequest({
-            url: page.url(),
-            userData: { label: "LIST" },
-          });
+      if (!targetCard) {
+        noNewCardsStreak++;
+        if (noNewCardsStreak >= MAX_NO_NEW_STREAK) {
+          log.info("No new cards after scrolling — reached end of list.");
+          break;
         }
         log.info(
           `No new cards in DOM (streak ${noNewCardsStreak}/${MAX_NO_NEW_STREAK}), scrolling…`,
@@ -158,21 +157,11 @@ const crawler = new PlaywrightCrawler({
         continue;
       }
 
-      await page.waitForTimeout(500);
+      await sleep(delayBetweenJobsMs);
 
-      const job = await page.evaluate(() => {
-        const get = (sel) =>
-          document.querySelector(sel)?.innerText?.trim() || null;
-
-        return {
-          title: get("h1"),
-          company: get(".topcard__org-name-link, .topcard__flavor"),
-          location: get(".topcard__flavor--bullet"),
-          description:
-            document.querySelector(".show-more-less-html__markup")?.innerText ||
-            null,
-          link: window.location.href,
-        };
+      const job = await page.evaluate(extractJobDetails).catch((err) => {
+        log.warning(`Extraction failed for id=${targetId}: ${err.message}`);
+        return null;
       });
 
       if (!job) continue;
