@@ -1,196 +1,163 @@
-import { Actor, log as actorLog } from "apify";
-import { PlaywrightCrawler, Dataset, sleep } from "crawlee";
-import { chromium } from "playwright";
-import { extractJobDetails, buildPaginatedUrls } from "./utils.js";
+import { Actor } from "apify";
+import { PlaywrightCrawler, Dataset, RequestQueue } from "crawlee";
 
 await Actor.init();
 
-const input = (await Actor.getInput()) ?? {};
+const input = await Actor.getInput();
 
 const {
-  startUrl = "https://www.linkedin.com/jobs/search/?f_E=1%2C2%2C3&f_F=it%2Ceng&f_TPR=r86400&geoId=102713980&location=India&sortBy=R",
-  maxJobs = 100,
-  maxPagesPerQuery = 5,
-  delayBetweenJobsMs = 1500,
-  proxyConfiguration: proxyConfig,
+  startUrls = [
+    "https://www.linkedin.com/jobs/search/?keywords=software&location=India",
+  ],
+  maxJobs = 8000,
 } = input;
 
-const proxyConfiguration = proxyConfig
-  ? await Actor.createProxyConfiguration(proxyConfig)
-  : undefined;
+// 🔐 Proxy (MANDATORY for LinkedIn at scale)
+const proxyConfiguration = await Actor.createProxyConfiguration({
+  useApifyProxy: true,
+  groups: ["RESIDENTIAL"],
+});
 
-let jobsScraped = 0;
+// 📦 Queue + dedup
+const requestQueue = await RequestQueue.open();
+const seen = new Set();
+
+// 🌱 Seed LIST pages
+for (const url of startUrls) {
+  await requestQueue.addRequest({
+    url,
+    userData: { label: "LIST", page: 0 },
+  });
+}
 
 const crawler = new PlaywrightCrawler({
+  requestQueue,
   proxyConfiguration,
+
+  // ⚡ HIGH PARALLELISM
+  minConcurrency: 10,
+  maxConcurrency: 40,
+
+  // ⏱ Timeouts
+  requestHandlerTimeoutSecs: 90,
+  maxRequestRetries: 3,
+
+  // 🔄 Session rotation
+  useSessionPool: true,
+  sessionPoolOptions: {
+    maxPoolSize: 100,
+  },
+
   launchContext: {
-    launcher: chromium,
     launchOptions: {
       headless: true,
       args: [
         "--no-sandbox",
-        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
         "--disable-blink-features=AutomationControlled",
       ],
     },
   },
-  browserPoolOptions: {
-    useFingerprints: true,
-  },
-  maxRequestsPerCrawl: maxPagesPerQuery * 25 + 10,
-  requestHandlerTimeoutSecs: 180,
 
   async requestHandler({ page, request, log }) {
-    log.info(`Processing: ${request.url}`);
+    const { label, page: pageNum = 0 } = request.userData;
 
-    await page.addInitScript(() => {
-      Object.defineProperty(navigator, "webdriver", { get: () => false });
-    });
+    // =========================
+    // 📄 LIST PAGE (FAST)
+    // =========================
+    if (label === "LIST") {
+      log.info(`LIST page ${pageNum}: ${request.url}`);
 
-    const LIST_SELECTOR =
-      "ul.jobs-search__results-list, .scaffold-layout__list-container";
-    await page.waitForSelector(LIST_SELECTOR, { timeout: 30_000 });
-    await sleep(2000);
-
-    const pageNum = request.userData?.pageNum ?? 0;
-    log.info(`Scraping page ${pageNum + 1}...`);
-
-    const CARD_SELECTOR = [
-      "ul.jobs-search__results-list > li",
-      ".scaffold-layout__list-container .job-card-container",
-    ].join(", ");
-
-    const DETAIL_PANEL_SELECTOR = [
-      ".show-more-less-html__markup",
-      ".job-view-layout",
-      ".details-pane__content",
-      ".jobs-description",
-      ".job-details-jobs-unified-top-card__job-title",
-    ].join(", ");
-
-    /**
-     * BUG FIX: getCardId previously used card.getAttribute() which is a
-     * Playwright node-side API returning Promise<string|null>. When the
-     * attribute is absent it resolves to null — the .catch() branch never
-     * fires — so every card got id=null, making `id && ...` always false,
-     * and no card was ever selected.
-     *
-     * Fix: run via page.evaluate(fn, el) so the read happens inside the
-     * browser where element attributes are always accessible.
-     */
-    const getCardId = (card) =>
-      page
-        .evaluate((el) => {
-          const jobId = el.getAttribute("data-job-id");
-          if (jobId) return jobId;
-          const anchor = el.querySelector('a[href*="/jobs/view/"]');
-          if (anchor) {
-            const m = anchor.href.match(/\/jobs\/view\/(\d+)/);
-            return m ? m[1] : anchor.href;
-          }
-          return el.innerText?.trim().slice(0, 80) ?? null;
-        }, card)
-        .catch(() => null);
-
-    const processedIds = new Set();
-    let noNewCardsStreak = 0;
-    const MAX_NO_NEW_STREAK = 5;
-
-    while (jobsScraped < maxJobs) {
-      const domCards = await page.$$(CARD_SELECTOR);
-
-      let targetCard = null;
-      let targetId = null;
-      for (const card of domCards) {
-        const id = await getCardId(card);
-        if (id && !processedIds.has(id)) {
-          targetCard = card;
-          targetId = id;
-          break;
-        }
-      }
-
-      if (!targetCard) {
-        noNewCardsStreak++;
-        if (noNewCardsStreak >= MAX_NO_NEW_STREAK) {
-          log.info("No new cards after scrolling — reached end of list.");
-          break;
-        }
-        log.info(
-          `No new cards in DOM (streak ${noNewCardsStreak}/${MAX_NO_NEW_STREAK}), scrolling…`,
-        );
-        const lastCard = domCards[domCards.length - 1];
-        if (lastCard) await lastCard.scrollIntoViewIfNeeded();
-        await sleep(1500);
-        continue;
-      }
-
-      noNewCardsStreak = 0;
-      processedIds.add(targetId);
-
-      const cardLink = await targetCard
-        .$eval(
-          'a.base-card__full-link, a.job-card-list__title, a[href*="/jobs/view/"]',
-          (el) => el.href,
-        )
-        .catch(() => null);
-
-      try {
-        await targetCard.scrollIntoViewIfNeeded();
-        await sleep(300);
-        await targetCard.click({ timeout: 5000 }).catch(async () => {
-          const anchor =
-            (await targetCard.$(
-              'a.base-card__full-link, a[href*="/jobs/view/"]',
-            )) ?? targetCard;
-          await anchor.dispatchEvent("click");
-        });
-      } catch (err) {
-        log.warning(`Could not click card id=${targetId}: ${err.message}`);
-        continue;
-      }
-
-      try {
-        await page.waitForSelector(DETAIL_PANEL_SELECTOR, { timeout: 15_000 });
-      } catch {
-        log.warning(`Detail panel did not load for id=${targetId}, skipping.`);
-        continue;
-      }
-
-      await sleep(delayBetweenJobsMs);
-
-      const job = await page.evaluate(extractJobDetails).catch((err) => {
-        log.warning(`Extraction failed for id=${targetId}: ${err.message}`);
-        return null;
+      await page.waitForSelector(".jobs-search__results-list", {
+        timeout: 15000,
       });
 
-      if (!job) continue;
-      if (!job.link && cardLink) job.link = cardLink;
+      // 🔽 Minimal scroll (LinkedIn loads quickly)
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await page.waitForTimeout(500);
 
-      log.info(`✓ [${jobsScraped + 1}] ${job.title} @ ${job.company}`);
-      await Dataset.pushData(job);
-      jobsScraped++;
+      // 🔗 Extract links
+      let links = await page.$$eval(".jobs-search__results-list li a", (as) =>
+        as.map((a) => a.href),
+      );
+
+      // ✅ Clean links
+      links = links.filter(
+        (l) => l && l.includes("/jobs/view/") && !l.includes("authwall"),
+      );
+
+      log.info(`Found ${links.length} links`);
+
+      // 🚀 Enqueue DETAIL pages (parallel engine)
+      for (const link of links) {
+        if (seen.size >= maxJobs) break;
+
+        if (!seen.has(link)) {
+          seen.add(link);
+
+          await requestQueue.addRequest({
+            url: link,
+            userData: { label: "DETAIL" },
+          });
+        }
+      }
+
+      // 🔁 Pagination (SUPER FAST)
+      if (seen.size < maxJobs) {
+        const nextStart = (pageNum + 1) * 25;
+
+        const nextUrl = new URL(request.url);
+        nextUrl.searchParams.set("start", nextStart);
+
+        await requestQueue.addRequest({
+          url: nextUrl.toString(),
+          userData: { label: "LIST", page: pageNum + 1 },
+        });
+
+        log.info(`Queued next page: ${nextStart}`);
+      }
     }
 
-    if (jobsScraped < maxJobs && pageNum + 1 < maxPagesPerQuery) {
-      const nextPageStart = (pageNum + 1) * 25;
-      const nextUrl = buildPaginatedUrls(request.url, nextPageStart);
-      if (nextUrl) {
-        await crawler.addRequests([
-          { url: nextUrl, userData: { pageNum: pageNum + 1 } },
-        ]);
-        log.info(`Queued page ${pageNum + 2}: ${nextUrl}`);
-      }
+    // =========================
+    // 📄 DETAIL PAGE (PARALLEL)
+    // =========================
+    else if (label === "DETAIL") {
+      // ❌ Skip blocked
+      if (request.url.includes("authwall")) return;
+
+      await page.waitForLoadState("domcontentloaded");
+
+      // Small delay to stabilize DOM
+      await page.waitForTimeout(200);
+
+      const job = await page.evaluate(() => {
+        const get = (sel) =>
+          document.querySelector(sel)?.innerText?.trim() || null;
+
+        return {
+          title: get("h1"),
+          company: get(".topcard__org-name-link, .topcard__flavor"),
+          location: get(".topcard__flavor--bullet"),
+          description:
+            document.querySelector(".show-more-less-html__markup")?.innerText ||
+            null,
+          link: window.location.href,
+        };
+      });
+
+      if (!job.title) return;
+
+      await Dataset.pushData(job);
+
+      log.info(`✓ ${job.title}`);
     }
   },
 
   failedRequestHandler({ request, log }) {
-    log.error(`Request failed: ${request.url}`);
+    log.error(`Failed: ${request.url}`);
   },
 });
 
-await crawler.run([{ url: startUrl, userData: { pageNum: 0 } }]);
+await crawler.run();
 
-// FIX: `log` only exists inside requestHandler scope — use actorLog at module level
-actorLog.info(`✅ Done. Total jobs scraped: ${jobsScraped}`);
 await Actor.exit();
