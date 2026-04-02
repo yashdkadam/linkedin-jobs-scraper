@@ -1,29 +1,21 @@
-export const handleDetail = async ({ page, request, pushData, log }) => {
+import { Dataset } from "crawlee";
+
+export const handleDetail = async ({ page, request, log }) => {
   try {
-    await page.waitForSelector("h1", { timeout: 5000 });
+    await page.waitForSelector(".top-card-layout__title", { timeout: 10000 });
 
-    const data = await page.evaluate(() => {
-      const getText = (sel) =>
-        document.querySelector(sel)?.innerText.trim() || "";
-
-      return {
-        title: getText("h1"),
-        company: getText(".topcard__org-name-link"),
-        location: getText(".topcard__flavor--bullet"),
-        description: getText(".show-more-less-html__markup"),
-      };
-    });
-
-    data.link = request.url;
+    const data = await page.evaluate(() => ({
+      title: document.querySelector(".top-card-layout__title")?.innerText,
+      company: document.querySelector(".topcard__org-name-link")?.innerText,
+      location: document.querySelector(".topcard__flavor--bullet")?.innerText,
+      description: document.querySelector(".description__text")?.innerText,
+      link: window.location.href,
+    }));
 
     log.info(`✓ ${data.title}`);
 
-    await pushData(data);
-
-    // HUMAN-LIKE DELAY
-    await page.waitForTimeout(1000 + Math.random() * 2000);
+    await Dataset.pushData(data);
   } catch (err) {
-    log.warning(`Retrying: ${request.url}`);
-    throw err;
+    log.warning(`❌ Failed detail: ${request.url}`);
   }
 };
