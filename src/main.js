@@ -6,56 +6,38 @@ await Actor.init();
 const input = await Actor.getInput();
 
 const {
-  startUrls = [
-    "https://www.linkedin.com/jobs/search/?keywords=software&location=India",
-  ],
-  maxJobs = 8000,
+  url, // 🔥 single URL input
+  maxJobs = 100, // limit
 } = input;
 
-// 🔐 Proxy (MANDATORY for LinkedIn at scale)
-const proxyConfiguration = await Actor.createProxyConfiguration({
-  useApifyProxy: true,
-  groups: ["RESIDENTIAL"],
-});
+if (!url) throw new Error("Please provide 'url'");
 
-// 📦 Queue + dedup
 const requestQueue = await RequestQueue.open();
 const seen = new Set();
 
-// 🌱 Seed LIST pages
-for (const url of startUrls) {
-  await requestQueue.addRequest({
-    url,
-    userData: { label: "LIST", page: 0 },
-  });
-}
+// Seed only ONE URL
+await requestQueue.addRequest({
+  url,
+  userData: { label: "LIST", page: 0 },
+});
 
 const crawler = new PlaywrightCrawler({
   requestQueue,
-  proxyConfiguration,
 
-  // ⚡ HIGH PARALLELISM
-  minConcurrency: 10,
-  maxConcurrency: 40,
+  // ✅ Safe config (avoid 429)
+  minConcurrency: 3,
+  maxConcurrency: 8,
 
-  // ⏱ Timeouts
   requestHandlerTimeoutSecs: 90,
   maxRequestRetries: 3,
 
-  // 🔄 Session rotation
   useSessionPool: true,
-  sessionPoolOptions: {
-    maxPoolSize: 100,
-  },
+  persistCookiesPerSession: true,
 
-  launchContext: {
-    launchOptions: {
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-blink-features=AutomationControlled",
-      ],
+  sessionPoolOptions: {
+    maxPoolSize: 50,
+    sessionOptions: {
+      maxUsageCount: 20,
     },
   },
 
@@ -63,32 +45,43 @@ const crawler = new PlaywrightCrawler({
     const { label, page: pageNum = 0 } = request.userData;
 
     // =========================
-    // 📄 LIST PAGE (FAST)
+    // 📄 LIST PAGE
     // =========================
     if (label === "LIST") {
-      log.info(`LIST page ${pageNum}: ${request.url}`);
+      log.info(`Scraping LIST page ${pageNum + 1}`);
 
       await page.waitForSelector(".jobs-search__results-list", {
         timeout: 15000,
       });
 
-      // 🔽 Minimal scroll (LinkedIn loads quickly)
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await page.waitForTimeout(500);
+      // 🔽 Scroll to load all jobs
+      let prev = 0;
+      for (let i = 0; i < 10; i++) {
+        await page.evaluate(() =>
+          window.scrollTo(0, document.body.scrollHeight),
+        );
+        await page.waitForTimeout(300);
+
+        const count = await page.$$eval(
+          ".jobs-search__results-list li",
+          (els) => els.length,
+        );
+
+        if (count === prev) break;
+        prev = count;
+      }
 
       // 🔗 Extract links
       let links = await page.$$eval(".jobs-search__results-list li a", (as) =>
         as.map((a) => a.href),
       );
 
-      // ✅ Clean links
       links = links.filter(
         (l) => l && l.includes("/jobs/view/") && !l.includes("authwall"),
       );
 
-      log.info(`Found ${links.length} links`);
+      log.info(`Found ${links.length} jobs`);
 
-      // 🚀 Enqueue DETAIL pages (parallel engine)
       for (const link of links) {
         if (seen.size >= maxJobs) break;
 
@@ -102,7 +95,7 @@ const crawler = new PlaywrightCrawler({
         }
       }
 
-      // 🔁 Pagination (SUPER FAST)
+      // Pagination (same query only)
       if (seen.size < maxJobs) {
         const nextStart = (pageNum + 1) * 25;
 
@@ -114,21 +107,18 @@ const crawler = new PlaywrightCrawler({
           userData: { label: "LIST", page: pageNum + 1 },
         });
 
-        log.info(`Queued next page: ${nextStart}`);
+        log.info(`Queued page ${pageNum + 2}`);
       }
     }
 
     // =========================
-    // 📄 DETAIL PAGE (PARALLEL)
+    // 📄 DETAIL PAGE
     // =========================
-    else if (label === "DETAIL") {
-      // ❌ Skip blocked
+    else {
       if (request.url.includes("authwall")) return;
 
       await page.waitForLoadState("domcontentloaded");
-
-      // Small delay to stabilize DOM
-      await page.waitForTimeout(200);
+      await page.waitForTimeout(300);
 
       const job = await page.evaluate(() => {
         const get = (sel) =>
@@ -145,16 +135,12 @@ const crawler = new PlaywrightCrawler({
         };
       });
 
-      if (!job.title) return;
+      if (!job?.title) return;
 
       await Dataset.pushData(job);
 
       log.info(`✓ ${job.title}`);
     }
-  },
-
-  failedRequestHandler({ request, log }) {
-    log.error(`Failed: ${request.url}`);
   },
 });
 
