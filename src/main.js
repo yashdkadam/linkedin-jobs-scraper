@@ -54,7 +54,7 @@ const crawler = new PlaywrightCrawler({
     const { label } = request.userData;
 
     // 🔥 HUMAN-LIKE DELAY
-    await page.waitForTimeout(2000 + Math.random() * 2000);
+    await page.waitForTimeout(200 + Math.random() * 200);
 
     // =========================
     // 📄 LIST PAGE
@@ -65,7 +65,7 @@ const crawler = new PlaywrightCrawler({
       await page.waitForLoadState("domcontentloaded");
 
       await page.waitForSelector(".jobs-search__results-list", {
-        timeout: 30000,
+        timeout: 3000,
       });
 
       // 🔽 Scroll to load jobs
@@ -75,7 +75,7 @@ const crawler = new PlaywrightCrawler({
         await page.evaluate(() =>
           window.scrollTo(0, document.body.scrollHeight),
         );
-        await page.waitForTimeout(1200);
+        await page.waitForTimeout(120);
 
         const currentCount = await page.$$eval(
           ".jobs-search__results-list li",
@@ -120,7 +120,7 @@ const crawler = new PlaywrightCrawler({
           log.info("Moving to next page...");
 
           await nextBtn.click();
-          await page.waitForTimeout(2500);
+          await page.waitForTimeout(250);
 
           await requestQueue.addRequest({
             url: page.url(),
@@ -144,7 +144,7 @@ const crawler = new PlaywrightCrawler({
         return;
       }
 
-      await page.waitForTimeout(1000);
+      await page.waitForTimeout(500);
 
       const job = await page.evaluate(() => {
         const get = (sel) =>
