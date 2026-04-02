@@ -48,92 +48,139 @@ const crawler = new PlaywrightCrawler({
       Object.defineProperty(navigator, "webdriver", { get: () => false });
     });
 
-    // ── Wait for job list (try both logged-in and public selectors) ──
+    // ── Wait for job list (covers both public + logged-in LinkedIn layouts) ──
     const LIST_SELECTOR =
       "ul.jobs-search__results-list, .scaffold-layout__list-container";
     await page.waitForSelector(LIST_SELECTOR, { timeout: 30_000 });
-    await sleep(2000); // let lazy-loaded cards render
+    await sleep(2000);
 
     const pageNum = request.userData?.pageNum ?? 0;
     log.info(`Scraping page ${pageNum + 1}...`);
 
-    // ── Count cards once (just for logging) ──
-    // We do NOT store handles — they go stale after LinkedIn re-renders the list
-    const CARD_SELECTOR =
-      "ul.jobs-search__results-list > li, .scaffold-layout__list-container .job-card-container";
-    const totalCards = await page.$$eval(CARD_SELECTOR, (els) => els.length);
-    log.info(`Found ${totalCards} job cards`);
+    /**
+     * VIRTUAL LIST STRATEGY
+     * ─────────────────────
+     * LinkedIn renders only ~30-40 cards in the DOM at any time.
+     * As you scroll, old cards are REMOVED and new ones are ADDED.
+     * Iterating by index (0..totalCards) breaks past ~40.
+     *
+     * Fix: track which jobs we've already processed by their job ID
+     * (extracted from the card's data-job-id attribute or href).
+     * On each loop tick, query the current DOM cards, find the first
+     * unprocessed one, click it, then scroll to reveal more.
+     */
 
-    for (let i = 0; i < totalCards; i++) {
-      if (jobsScraped >= maxJobs) {
-        log.info(`Reached maxJobs limit (${maxJobs}). Stopping.`);
-        return;
+    const CARD_SELECTOR = [
+      "ul.jobs-search__results-list > li",
+      ".scaffold-layout__list-container .job-card-container",
+    ].join(", ");
+
+    const DETAIL_PANEL_SELECTOR = [
+      ".show-more-less-html__markup",
+      ".job-view-layout",
+      ".details-pane__content",
+      ".jobs-description",
+      ".job-details-jobs-unified-top-card__job-title",
+    ].join(", ");
+
+    // Helper: extract a stable ID from a card element
+    const getCardId = async (card) => {
+      return card
+        .getAttribute("data-job-id")
+        .catch(() =>
+          card
+            .$eval(
+              'a[href*="/jobs/view/"]',
+              (a) => a.href.match(/\/jobs\/view\/(\d+)/)?.[1] ?? a.href,
+            )
+            .catch(() => null),
+        );
+    };
+
+    const processedIds = new Set();
+    let noNewCardsStreak = 0;
+    const MAX_NO_NEW_STREAK = 5; // stop if 5 scroll attempts yield nothing new
+
+    while (jobsScraped < maxJobs) {
+      // Query whatever cards are currently in the DOM
+      const domCards = await page.$$(CARD_SELECTOR);
+
+      // Find the first card we haven't processed yet
+      let targetCard = null;
+      let targetId = null;
+      for (const card of domCards) {
+        const id = await getCardId(card);
+        if (id && !processedIds.has(id)) {
+          targetCard = card;
+          targetId = id;
+          break;
+        }
       }
 
-      // ── Re-query the nth card fresh on every iteration (avoids stale handles) ──
-      const cards = await page.$$(CARD_SELECTOR);
-      const card = cards[i];
-      if (!card) {
-        log.warning(`Card ${i + 1} not found after re-query, skipping.`);
+      // No unprocessed card visible → scroll down to reveal more
+      if (!targetCard) {
+        noNewCardsStreak++;
+        if (noNewCardsStreak >= MAX_NO_NEW_STREAK) {
+          log.info("No new cards after scrolling — reached end of list.");
+          break;
+        }
+        log.info(
+          `No new cards in DOM (streak ${noNewCardsStreak}/${MAX_NO_NEW_STREAK}), scrolling…`,
+        );
+        // Scroll the last visible card into view to trigger LinkedIn's lazy load
+        const lastCard = domCards[domCards.length - 1];
+        if (lastCard) await lastCard.scrollIntoViewIfNeeded();
+        await sleep(1500);
         continue;
       }
 
-      // ── Grab the fallback link from the card before clicking ──
-      const cardLink = await card
+      noNewCardsStreak = 0;
+      processedIds.add(targetId);
+
+      // ── Grab fallback href before clicking ──
+      const cardLink = await targetCard
         .$eval(
-          "a.base-card__full-link, a.job-card-list__title, a[data-tracking-control-name]",
+          'a.base-card__full-link, a.job-card-list__title, a[href*="/jobs/view/"]',
           (el) => el.href,
         )
         .catch(() => null);
 
-      // ── Scroll into view then click via JS (bypasses overlay issues) ──
+      // ── Scroll into view, then click (JS fallback if overlaid) ──
       try {
-        await card.scrollIntoViewIfNeeded();
+        await targetCard.scrollIntoViewIfNeeded();
         await sleep(300);
-
-        // Try native Playwright click first, fall back to JS click
-        await card.click({ timeout: 5000 }).catch(async () => {
-          const clickable =
-            (await card.$(
-              "a.base-card__full-link, a.job-card-list__title, .job-card-container__link",
-            )) ?? card;
-          await clickable.dispatchEvent("click");
+        await targetCard.click({ timeout: 5000 }).catch(async () => {
+          const anchor =
+            (await targetCard.$(
+              'a.base-card__full-link, a[href*="/jobs/view/"]',
+            )) ?? targetCard;
+          await anchor.dispatchEvent("click");
         });
       } catch (err) {
-        log.warning(`Could not click card ${i + 1}: ${err.message}`);
+        log.warning(`Could not click card (id=${targetId}): ${err.message}`);
         continue;
       }
 
-      // ── Wait for the right-side detail panel to reflect the new job ──
+      // ── Wait for right panel to load ──
       try {
-        await page.waitForSelector(
-          [
-            ".show-more-less-html__markup",
-            ".job-view-layout",
-            ".details-pane__content",
-            ".jobs-description",
-            ".job-details-jobs-unified-top-card__job-title",
-          ].join(", "),
-          { timeout: 15_000 },
-        );
+        await page.waitForSelector(DETAIL_PANEL_SELECTOR, { timeout: 15_000 });
       } catch {
-        log.warning(`Detail panel did not load for card ${i + 1}, skipping.`);
+        log.warning(`Detail panel did not load for id=${targetId}, skipping.`);
         continue;
       }
 
       await sleep(delayBetweenJobsMs);
 
-      // ── Extract structured data from the right panel ──
+      // ── Extract ──
       const job = await page.evaluate(extractJobDetails).catch((err) => {
-        log.warning(`Extraction failed for card ${i + 1}: ${err.message}`);
+        log.warning(`Extraction failed for id=${targetId}: ${err.message}`);
         return null;
       });
 
       if (!job) continue;
-
       if (!job.link && cardLink) job.link = cardLink;
 
-      log.info(`✓ [${i + 1}/${totalCards}] ${job.title} @ ${job.company}`);
+      log.info(`✓ [${jobsScraped + 1}] ${job.title} @ ${job.company}`);
       await Dataset.pushData(job);
       jobsScraped++;
     }
