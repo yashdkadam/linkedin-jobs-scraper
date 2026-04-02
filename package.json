@@ -1,19 +1,14 @@
 {
   "name": "linkedin-jobs-scraper",
   "version": "1.0.0",
-  "description": "Apify actor to scrape LinkedIn job listings using the side-panel (no new tab per job)",
   "type": "module",
   "main": "src/main.js",
   "scripts": {
-    "start": "node src/main.js",
-    "start:dev": "APIFY_IS_AT_HOME=0 node src/main.js"
+    "start": "node src/main.js"
   },
   "dependencies": {
-    "apify": "^3.3.2",
-    "crawlee": "^3.10.0",
-    "playwright": "^1.44.0"
-  },
-  "engines": {
-    "node": ">=18"
+    "apify": "^3.0.0",
+    "crawlee": "^3.0.0",
+    "playwright-chromium": "^1.40.0"
   }
 }

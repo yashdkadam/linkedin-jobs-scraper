@@ -1,22 +1,30 @@
-import { Actor } from "apify";
-
-await Actor.init();
-
-const queries = [
-  "software engineer india",
-  "backend developer india",
-  "frontend developer india",
-  "java developer india",
-  "python developer india",
-];
-
-for (const q of queries) {
-  const url = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(q)}&location=India`;
-
-  await Actor.call("YOUR_WORKER", {
-    startUrls: [url],
-    maxJobs: 2000,
-  });
+/**
+ * Safely extract text from a DOM element
+ */
+export function getText(page, selector) {
+  return page.$eval(selector, (el) => el.innerText.trim()).catch(() => "");
 }
 
-await Actor.exit();
+/**
+ * Extract number from strings like "200 applicants"
+ */
+export function parseCount(str) {
+  if (!str) return null;
+  const match = str.match(/[\d,]+/);
+  return match ? parseInt(match[0].replace(/,/g, ""), 10) : null;
+}
+
+/**
+ * Build a unique tracking ID for deduplication
+ */
+export function makeJobId(url) {
+  const match = url.match(/\/(\d{10,})/);
+  return match ? match[1] : null;
+}
+
+/**
+ * Sleep for ms milliseconds
+ */
+export function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

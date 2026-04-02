@@ -3,13 +3,26 @@
   "type": "object",
   "schemaVersion": 1,
   "properties": {
-    "url": {
-      "title": "Search URL",
-      "type": "string",
-      "editor": "textfield",
-      "description": "LinkedIn jobs search URL",
-      "default": "https://www.linkedin.com/jobs/search/?f_E=1%2C2%2C3&f_TPR=r86400&geoId=102713980&location=India"
+    "urls": {
+      "title": "LinkedIn Job Search URLs",
+      "type": "array",
+      "description": "List of LinkedIn job search URLs to scrape",
+      "editor": "stringList",
+      "prefill": ["https://www.linkedin.com/jobs/search/?location=India"]
+    },
+    "count": {
+      "title": "Max Jobs to Scrape",
+      "type": "integer",
+      "description": "Maximum number of job listings to scrape per URL",
+      "default": 100,
+      "maximum": 10000
+    },
+    "scrapeCompany": {
+      "title": "Scrape Company Details",
+      "type": "boolean",
+      "description": "Also visit company pages to get extra details",
+      "default": false
     }
   },
-  "required": ["url"]
+  "required": ["urls"]
 }
